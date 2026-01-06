@@ -8,9 +8,9 @@ Supports cookie extraction and authentication
 
 from burp import IBurpExtender, ITab, IHttpListener, IContextMenuFactory
 from javax.swing import (JPanel, JButton, JTextField, JLabel, JScrollPane, 
-                         JTable, JSplitPane, JMenuItem, JTextArea, JCheckBox,
-                         BoxLayout, BorderFactory, JFileChooser, SwingUtilities,
-                         JProgressBar, Box)
+                          JTable, JSplitPane, JMenuItem, JTextArea, JCheckBox,
+                          BoxLayout, BorderFactory, JFileChooser, SwingUtilities,
+                          JProgressBar, Box)
 from javax.swing.table import DefaultTableModel
 from java.awt import BorderLayout, GridLayout, Dimension, Color, Font
 from java.awt.event import ActionListener
@@ -40,7 +40,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
         self.config = {
             'auto_scan': False,
             'scanner_path': None,
-            'python_path': 'python3'
+            'python_path': 'python3' # Ensure python3 is in your system PATH or provide full path here
         }
         
         # Find scanner script
@@ -156,6 +156,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
         # Options row
         options_panel = JPanel(GridLayout(1, 3))
         self.auto_scan_checkbox = JCheckBox("Auto-scan JS files", False)
+        # FIX: Added the listener class at the bottom of the file
         self.auto_scan_checkbox.addActionListener(AutoScanListener(self))
         self.skip_dynamic_checkbox = JCheckBox("Skip dynamic analysis (faster)", True)
         self.verbose_checkbox = JCheckBox("Verbose output", False)
@@ -722,25 +723,54 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
         SwingUtilities.invokeLater(append)
 
 
-# Context menu action listener
+# FIX: Added the missing AutoScanListener class
+class AutoScanListener(ActionListener):
+    """Listener for the Auto-scan checkbox"""
+    def __init__(self, extender):
+        self.extender = extender
+
+    def actionPerformed(self, event):
+        # Update config based on checkbox state
+        is_selected = self.extender.auto_scan_checkbox.isSelected()
+        self.extender.config['auto_scan'] = is_selected
+        
+        status = "enabled" if is_selected else "disabled"
+        self.extender._append_output("\n[*] Auto-scan %s" % status)
+
+# FIX: Fixed the incomplete ScanActionListener class
 class ScanActionListener(ActionListener):
+    """Handles the 'Scan for Endpoints' context menu click"""
     def __init__(self, extender, messages):
         self.extender = extender
         self.messages = messages
     
     def actionPerformed(self, event):
-        """Handle context menu action"""
         if not self.messages:
             return
         
+        # Get the URL from the selected message
         message = self.messages[0]
         url = str(message.getUrl())
         
-        # Extract base URL
-        try:
-            from urlparse import urlparse
-        except:
-            from urllib.parse import urlparse
+        # Switch focus to our tab
+        self.extender.panel.requestFocus()
         
-        parsed = urlparse(url)
-        base_url = "%s://%s" % (parsed.scheme, parsed.netloc)
+        # Populate the URL field
+        self.extender.url_field.setText(url)
+        
+        # Extract and populate cookies automatically from the request
+        try:
+            request_info = self.extender._helpers.analyzeRequest(message)
+            headers = request_info.getHeaders()
+            for header in headers:
+                if str(header).lower().startswith('cookie:'):
+                    # Remove 'Cookie:' prefix and whitespace
+                    cookie_val = str(header)[7:].strip()
+                    self.extender.cookie_field.setText(cookie_val)
+                    self.extender._append_output("[+] Auto-filled cookies from request")
+                    break
+        except:
+            pass
+            
+        self.extender._append_output("\n[+] Target set: %s" % url)
+        self.extender._append_output("[*] Click 'Start Scan' to begin")
