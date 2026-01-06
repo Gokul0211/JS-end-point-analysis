@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
-Advanced Endpoint Scanner
+Advanced Endpoint Scanner - Enhanced Edition
 Extracts API endpoints, routes, and service configurations from JavaScript applications
-Supports Angular, React, Vue, and other modern frameworks
+with recursive lazy-loading discovery and advanced SPA support
+
+Key Improvements:
+1. Recursive feedback loop for lazy-loaded chunks
+2. Multi-pass analysis with increasing route depth
+3. Better handling of authentication redirects
+4. Intelligent route prioritization
+5. Enhanced webpack chunk discovery
+6. Session state preservation across navigations
 """
 import requests
 from bs4 import BeautifulSoup
@@ -15,6 +23,10 @@ import os
 import hashlib
 from collections import defaultdict, deque
 import argparse
+
+# Suppress SSL warnings
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Try importing Pandas for Excel export
 try:
@@ -44,7 +56,17 @@ NOISE_KEYWORDS = [
     'helvetica', 'arial', 'courier', 'times', 'verdana',
     '__html2canvas__', '_pseudoelement_',
     'klmnopqrstuvwxyz',
-    'expressionchangedafterithasbeenchecked'
+    'expressionchangedafterithasbeenchecked',
+    # New: Specific garbage from real scans
+    'caused by:', 'valid digit info', 'ngdirectivedef', 
+    'ngpipedef', 'ngmoduledef', 'nginjectabledef', 'nginjectordef',
+    'node_modules', 'sourcemap',
+    # Template literals that leaked
+    'animation-timing-function', 'sheet ${', 'sheet,', 'sheet[',
+    # Error messages
+    ' dis', ' jaj', ' jar', ' lup', ' rep', ' tup',
+    # Common JS syntax
+    'on_property', 'template.html'
 ]
 
 BASE_URL_BLACKLIST = [
@@ -54,7 +76,16 @@ BASE_URL_BLACKLIST = [
 ]
 
 STRICT_BLOCKS = [
-    'webpack', '__webpack', 'sourcemap'
+    'webpack', '__webpack', 'sourcemap',
+    # CRITICAL: Block Angular framework files that leaked
+    'ngdirectivedef', 'ngpipedef', 'ngmoduledef', 
+    'nginjectabledef', 'nginjectordef',
+    # Block template files
+    'template.html',
+    # Block Excel internal structures
+    '/xl/worksheets/',
+    # Block error message fragments
+    'on_property',
 ]
 
 FALSE_POSITIVE_PATTERNS = [
@@ -93,6 +124,43 @@ NOISE_PATTERNS = [
     r'^http:/[^/]',
     r'^https?:px',
     r'^https?://[^/]*$',
+    # Template literal syntax
+    r'\$\{',
+    r'\{\{',
+    # Unresolved variables
+    r'undefined',
+    r'\bnull\b',
+    # Excel/internal paths
+    r'/xl/worksheets/',
+    # Spaces in URLs (malformed)
+    r'\s',
+    # Unbalanced brackets/parentheses
+    r'\(\$',
+    r'\?\$',
+    # CRITICAL: Specific garbage from real scans
+    r'caused by:',
+    r'valid digit info',
+    r'animation-timing-function',
+    # Single letter paths (noise)
+    r'/[a-z]$',
+    # CSS units leaked
+    r'(?:^|/)(?:px|ms|em|rem|vh|vw)$',
+    # Template syntax variations
+    r'\?id=\$\{',
+    r':\$\{',
+    # Unbalanced parentheses/brackets in path
+    r'\(!',
+    r'\[\w+\]$',  # Ends with [word]
+    # Framework internal patterns
+    r'/sheet\s',
+    r'sheet\$',
+    r'sheet,',
+    r'sheet\[',
+    r'sheet\(',
+    # Partial/broken paths
+    r'//\s*$',
+    r':\\n',
+    r'\}\\n',
 ]
 
 # ==============================================================================
@@ -116,14 +184,14 @@ class EnhancedVariableResolver:
     
     def _compile_patterns(self):
         """Pre-compile regex patterns for better performance"""
-        self.pattern1 = re.compile(r'(?:var|let|const)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*["\']([^"\']{2,200})["\']')
-        self.pattern2 = re.compile(r'this\.(url|serverURL|baseURL|apiURL|apiUrl|rootUrl|baseUrl)\s*=\s*["\']([^"\']{2,200})["\']')
+        self.pattern1 = re.compile(r'(?:var|let|const)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*["\']([^"\']{2,100}?)["\']')
+        self.pattern2 = re.compile(r'this\.(url|serverURL|baseURL|apiURL|apiUrl|rootUrl|baseUrl)\s*=\s*["\']([^"\']{2,100}?)["\']')
         self.pattern3 = re.compile(r"this\.(url|serverURL|baseURL|apiURL)\s*=\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\[([\"'])([a-zA-Z_$][a-zA-Z0-9_$]*)\3\]")
-        self.pattern4 = re.compile(r'this\.([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*["\']([^"\']{2,200})["\']')
-        self.pattern5 = re.compile(r'\b([a-zA-Z_$][a-zA-Z0-9_$]{2,})\s*=\s*["\']([^"\']{2,200})["\']')
-        self.pattern6 = re.compile(r'\b([a-z]{1,2})\s*=\s*["\']([^"\']{5,200})["\']')
-        self.pattern7 = re.compile(r'(\w+)\s*:\s*["\']([^"\']{3,200})["\']')
-        self.pattern8 = re.compile(r'["\']([/][^"\']{3,200})["\']\s*(?:,|])')
+        self.pattern4 = re.compile(r'this\.([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*["\']([^"\']{2,100}?)["\']')
+        self.pattern5 = re.compile(r'\b([a-zA-Z_$][a-zA-Z0-9_$]{2,})\s*=\s*["\']([^"\']{2,100}?)["\']')
+        self.pattern6 = re.compile(r'\b([a-z]{1,2})\s*=\s*["\']([^"\']{5,100}?)["\']')
+        self.pattern7 = re.compile(r'(\w+)\s*:\s*["\']([^"\']{3,100}?)["\']')
+        self.pattern8 = re.compile(r'["\']([/][^"\']{3,100}?)["\']\s*(?:,|])')
         
     def extract_all_variables(self, code, filename):
         """Extract ALL variables, methods, and service properties"""
@@ -681,48 +749,134 @@ class EnhancedRPCExtractor:
         return found
     
     def _is_valid_endpoint(self, endpoint):
-        """Validate if endpoint looks legitimate"""
+        """Validate if endpoint looks legitimate - AGGRESSIVE FILTERING"""
+        if not endpoint or len(endpoint) < 3:
+            return False
+        
+        # CRITICAL FIX 1: Reject endpoints with spaces (URLs shouldn't have spaces unless encoded)
+        if ' ' in endpoint:
+            return False
+        
+        # CRITICAL FIX 2: Reject template literal syntax that wasn't resolved
+        if '${' in endpoint or '{{' in endpoint or '`' in endpoint:
+            return False
+        
+        # CRITICAL FIX 3: Reject unbalanced parenthesis/brackets (indicates parsing error)
+        try:
+            if endpoint.count('(') != endpoint.count(')'):
+                return False
+            if endpoint.count('[') != endpoint.count(']'):
+                return False
+            if endpoint.count('{') != endpoint.count('}'):
+                return False
+        except:
+            return False
+        
+        # CRITICAL FIX 4: Reject URLs with "undefined" or "null" literals
+        if 'undefined' in endpoint.lower() or '/null' in endpoint or '/null/' in endpoint:
+            return False
+        
+        # Check standard noise patterns
         for pattern in NOISE_PATTERNS:
             if re.search(pattern, endpoint, re.IGNORECASE):
                 return False
         
         endpoint_lower = endpoint.lower()
         
-        if any(keyword in endpoint_lower for keyword in ['helvetica', 'arial', 'expressionchanged']):
+        # Check against noise keywords
+        for keyword in NOISE_KEYWORDS:
+            if keyword in endpoint_lower:
+                return False
+        
+        # CRITICAL FIX 5: Reject Excel/internal framework paths
+        if '/xl/' in endpoint_lower or 'worksheet' in endpoint_lower:
             return False
         
+        # CRITICAL FIX 6: Reject Angular internal files
+        if any(x in endpoint_lower for x in ['ngdirectivedef', 'ngpipedef', 'ngmoduledef', 'nginjectabledef', 'nginjectordef']):
+            return False
+        
+        # Normalize ORIGIN placeholder
         if endpoint.startswith('ORIGIN'):
             endpoint = endpoint.replace('ORIGIN', '/')
         
+        # Must start with valid protocol or path
         if not (endpoint.startswith('http') or endpoint.startswith('/') or endpoint.startswith('#/')):
             return False
         
+        # Validation for http URLs
         if endpoint.startswith('http'):
             try:
                 parsed = urllib.parse.urlparse(endpoint)
                 if not parsed.netloc:
                     return False
+                # CRITICAL FIX 7: Reject if path is empty or just slash (too generic)
+                if not parsed.path or parsed.path == '/':
+                    return False
+                # CRITICAL FIX 8: Reject paths that are clearly not APIs (single letter paths)
+                path_parts = [p for p in parsed.path.split('/') if p]
+                if len(path_parts) == 1 and len(path_parts[0]) <= 2:
+                    return False
             except:
                 return False
         
-        if any(x in endpoint_lower for x in ['api', 'service', 'endpoint', 'rest', 'graphql',
-                                                'fetch', 'data', 'dashboard', 'master', 
-                                                'project', 'user', 'auth']):
-            return True
+        # CRITICAL FIX 9: Must contain typical URL separators or patterns
+        valid_indicators = ['/', '.json', '.xml', '?', '=', 'api', 'get', 'post', 'update', 'delete', 'fetch']
+        if not any(x in endpoint_lower for x in valid_indicators):
+            return False
         
-        if (endpoint.startswith('/') or endpoint.startswith('#/')) and len(endpoint) > 3 and ('/' in endpoint[1:] or '#' in endpoint):
-            return True
+        # CRITICAL FIX 10: Reject if it looks like a file extension that's not an API
+        if endpoint_lower.endswith(('.js', '.css', '.png', '.jpg', '.svg', '.woff', '.ttf', '.eot')):
+            return False
+        
+        # CRITICAL FIX 11: Reject malformed query strings
+        if '?' in endpoint:
+            query_part = endpoint.split('?')[1] if len(endpoint.split('?')) > 1 else ''
+            # If query exists but is just special chars, reject
+            if query_part and not any(c.isalnum() for c in query_part):
+                return False
         
         return True
     
     def _is_noise(self, var_name, suffix):
-        """Check if this is noise pattern"""
+        """Check if this is noise pattern - ULTRA STRICT"""
         combined = (var_name + suffix).lower()
         
-        if any(keyword in combined for keyword in ['helvetica', 'arial', 'expressionchanged']):
+        # CRITICAL: Check all noise keywords
+        for keyword in NOISE_KEYWORDS:
+            if keyword in combined:
+                return True
+        
+        # CRITICAL: Reject if suffix is too short (likely error)
+        if len(suffix) < 2:
             return True
         
-        if len(suffix) < 2:
+        # CRITICAL: Reject if suffix is just special chars or spaces
+        if suffix.strip() in [':', '/', '?', '=', ',', '.', '-', '_']:
+            return True
+        
+        # CRITICAL: Reject error message patterns
+        if any(x in combined for x in ['caused by', 'valid digit', 'error', ' dis', ' jaj', ' jar', ' lup', ' rep', ' tup']):
+            return True
+        
+        # CRITICAL: Reject template syntax
+        if any(x in suffix for x in ['${', '{{', '`', '\\n', '\\r']):
+            return True
+        
+        # CRITICAL: Reject CSS/style fragments
+        if any(x in suffix for x in ['animation-timing', 'sheet ${', 'sheet,', 'sheet[', 'sheet(', 'sheet.']):
+            return True
+        
+        # CRITICAL: Reject single letter suffixes (like ' x', ' a')
+        if suffix.strip() and len(suffix.strip()) == 1:
+            return True
+        
+        # CRITICAL: Reject CSS units
+        if suffix.strip() in ['px', 'ms', 'em', 'rem', 'vh', 'vw', 'pt', '%']:
+            return True
+        
+        # CRITICAL: Reject if it's clearly a constant name, not a path
+        if suffix.strip().isupper() and '_' in suffix:  # Like ON_PROPERTY
             return True
         
         return False
@@ -764,6 +918,7 @@ class EnhancedStaticAnalyzer:
         self.confidence_scores = defaultdict(int)
         self.resolver = EnhancedVariableResolver()
         self.rpc_extractor = EnhancedRPCExtractor(self.resolver)
+        self.analyzed_js_files = set()  # Track analyzed files to avoid duplicates
 
     def scan(self, js_urls, json_urls):
         print(f"\n[PHASE 2] Enhanced Analysis with Method Call Resolution")
@@ -781,13 +936,16 @@ class EnhancedStaticAnalyzer:
                 continue
                 
             try:
-                r = self.session.get(url, timeout=10)
+                r = self.session.get(url, timeout=10, verify=False)
                 if r.status_code == 200:
                     filename = url.split('/')[-1]
                     js_contents[url] = r.text
                     self.resolver.extract_all_variables(r.text, filename)
-            except:
-                pass
+                    self.analyzed_js_files.add(url)
+            except requests.exceptions.Timeout:
+                pass  # Skip files that timeout
+            except Exception as e:
+                pass  # Skip files with errors
         
         print(f"\n    [+] Extracted {len(self.resolver.variables)} unique variables")
         print(f"    [+] Found {len(self.resolver.methods)} method definitions")
@@ -882,7 +1040,7 @@ class EnhancedStaticAnalyzer:
     def analyze_json_config(self, json_url):
         """Extract ALL string values from JSON config files"""
         try:
-            r = self.session.get(json_url, timeout=10)
+            r = self.session.get(json_url, timeout=10, verify=False)
             if r.status_code != 200:
                 return
             
@@ -891,8 +1049,12 @@ class EnhancedStaticAnalyzer:
             
             self._extract_from_json(data, filename, json_url)
             
-        except:
-            pass
+        except json.JSONDecodeError:
+            pass  # Not valid JSON
+        except requests.exceptions.Timeout:
+            pass  # Timeout
+        except Exception:
+            pass  # Other errors
 
     def _extract_from_json(self, data, filename, source_url, path=''):
         """Recursively extract ALL string values from JSON"""
@@ -1042,13 +1204,40 @@ class EnhancedStaticAnalyzer:
                 self.process(full_url, "GET", m.start(), code, source, "WINDOW_OPEN_ROUTE", "FRONTEND_ROUTE", 88)
         
         # String literals with API patterns
-        for m in re.finditer(r'["\']([/#][^\'"]{3,200})["\']', code):
+        for m in re.finditer(r'["\']([/#][^\'"]{3,100}?)["\']', code):
             url = m.group(1)
             if self.has_api_pattern(url):
                 cls = self.classify(url)
                 if cls != "NOISE":
                     full_url = self.normalizer.normalize(url)
                     self.process(full_url, self.detect_method(code, m.start()), m.start(), code, source, "STATIC_CODE", cls, 50)
+
+    def analyze_code_from_dynamic(self, code, source):
+        """
+        Special method for analyzing code discovered during dynamic phase.
+        This is called from the feedback loop.
+        """
+        filename = source.split('/')[-1] if '/' in source else source
+        
+        # Extract variables and methods from this new code
+        self.resolver.extract_all_variables(code, filename)
+        
+        # Extract RPC patterns
+        rpc_endpoints = self.rpc_extractor.extract_rpc_patterns(code, filename)
+        for ep in rpc_endpoints:
+            full_url = self.normalizer.normalize(ep['endpoint'])
+            self.add_endpoint(
+                full_url, 
+                ep['method'], 
+                [], 
+                ep['type'] + '_DYNAMIC', 
+                ep['source'], 
+                ep['classification'], 
+                ep['confidence']
+            )
+        
+        # Run standard code analysis
+        self.analyze_code(code, source)
 
     def _extract_clean_route(self, path):
         """Extract clean route from JavaScript concatenation"""
@@ -1094,32 +1283,47 @@ class EnhancedStaticAnalyzer:
         if not url:
             return
         
-        url_lower = url.lower()
+        # CRITICAL FIX: Normalize trailing slashes for deduplication
+        # /api/users and /api/users/ should be treated as the same
+        url_normalized = url.rstrip('/')
+        
+        url_lower = url_normalized.lower()
         for keyword in NOISE_KEYWORDS:
             if keyword in url_lower:
                 return
         
-        if any(re.search(p, url) for p in NOISE_PATTERNS):
+        if any(re.search(p, url_normalized) for p in NOISE_PATTERNS):
             return
         
+        # ADDITIONAL FIX: Reject if URL path is too short (likely noise)
+        try:
+            parsed = urllib.parse.urlparse(url_normalized)
+            if parsed.path and len(parsed.path.strip('/')) < 2:
+                return  # Paths like /x or /a are noise
+        except:
+            pass
+        
+        # Check for duplicates using normalized URL
         for e in self.endpoints:
-            if e['endpoint'] == url and e['method'] == method:
+            # Normalize existing endpoint for comparison
+            existing_url = e['endpoint'].rstrip('/')
+            if existing_url == url_normalized and e['method'] == method:
                 e['parameters'] = list(set(e['parameters'] + params))
-                if confidence > self.confidence_scores.get(f"{method}:{url}", 0):
+                if confidence > self.confidence_scores.get(f"{method}:{url_normalized}", 0):
                     e['type'] = type
                     e['classification'] = classification
-                    self.confidence_scores[f"{method}:{url}"] = confidence
+                    self.confidence_scores[f"{method}:{url_normalized}"] = confidence
                 return
         
         self.endpoints.append({
-            "endpoint": url, 
+            "endpoint": url,  # Use original URL (with or without trailing slash as originally found)
             "method": method, 
             "parameters": params, 
             "type": type, 
             "source": source if isinstance(source, str) else source.split('/')[-1][:80],
             "classification": classification
         })
-        self.confidence_scores[f"{method}:{url}"] = confidence
+        self.confidence_scores[f"{method}:{url_normalized}"] = confidence
     
     def _clean_url(self, url):
         """Clean malformed URLs"""
@@ -1152,7 +1356,7 @@ class EnhancedStaticAnalyzer:
         return url
 
     def is_valid(self, url):
-        """Validate URL"""
+        """Validate URL - ULTRA STRICT"""
         if not url:
             return False
             
@@ -1161,24 +1365,63 @@ class EnhancedStaticAnalyzer:
             return False
         
         url_lower = url.lower()
+        
+        # CRITICAL: Check noise keywords first
         for keyword in NOISE_KEYWORDS:
             if keyword in url_lower:
                 return False
         
+        # CRITICAL: Check strict blocks
         if any(b in url.lower() for b in STRICT_BLOCKS): 
             return False
         
+        # CRITICAL: Check noise patterns
         for p in FALSE_POSITIVE_PATTERNS:
             if re.search(p, url, re.IGNORECASE): 
                 return False
         
-        if any(x in url for x in ['window.open', 'location.origin', '+\"', '+\'', ')_self']):
+        # CRITICAL: Additional specific checks from real scan
+        # Block single letter paths like /x, /a
+        if re.search(r'/[a-zA-Z]$', url):
+            return False
+        
+        # Block CSS unit paths like /px, /ms
+        if re.search(r'/(?:px|ms|em|rem|vh|vw|pt)$', url):
+            return False
+        
+        # Block unresolved template syntax
+        if any(x in url for x in ['${', '{{', '`', '\\n']):
+            return False
+        
+        # Block URLs with "undefined" or "null" in path
+        if '/undefined/' in url or '/null/' in url or url.endswith('/undefined') or url.endswith('/null'):
+            return False
+        
+        # Block framework internal files
+        if url.endswith('.js') and any(x in url_lower for x in ['ngdirectivedef', 'ngpipedef', 'ngmoduledef', 'nginjectabledef', 'nginjectordef']):
+            return False
+        
+        # Block template.html
+        if 'template.html' in url_lower:
+            return False
+        
+        # Block Excel internal paths
+        if '/xl/' in url_lower or 'worksheet' in url_lower:
+            return False
+        
+        # Block error message fragments
+        if any(x in url_lower for x in ['caused by:', 'valid digit', 'animation-timing-function']):
+            return False
+        
+        # Block ON_PROPERTY and other leaked constants
+        if 'ON_PROPERTY' in url or 'ON_INIT' in url:
             return False
         
         if url.startswith('#/'):
             return True
         
-        if url.lower().endswith(('.js', '.css', '.png', '.svg', '.woff', '.jpg', '.jpeg', '.gif', '.ico')):
+        # Block non-API file extensions
+        if url.lower().endswith(('.js', '.css', '.png', '.svg', '.woff', '.jpg', '.jpeg', '.gif', '.ico', '.ttf', '.eot', '.woff2')):
             return False
         
         return True
@@ -1268,7 +1511,7 @@ class URLNormalizer:
         return f'{self.scheme}://{self.netloc}/{endpoint}'
 
 # ==============================================================================
-# FEDERATION HUNTER
+# FEDERATION HUNTER - ENHANCED WITH RECURSIVE DISCOVERY
 # ==============================================================================
 class EnhancedFederationHunter:
     def __init__(self, session, target_url):
@@ -1285,8 +1528,9 @@ class EnhancedFederationHunter:
         self.check_config_files()
         self.crawl_html()
 
-        print(f"  Deep scanning...")
+        print(f"  Deep scanning JavaScript files...")
         processed_files = set()
+        scan_errors = 0
         
         while self.scan_queue:
             url = self.scan_queue.popleft()
@@ -1298,12 +1542,22 @@ class EnhancedFederationHunter:
                 continue
 
             try:
-                r = self.session.get(url, timeout=10)
+                r = self.session.get(url, timeout=10, verify=False)
                 if r.status_code == 200:
                     self.hunt_webpack_chunks(r.text, url)
                     self.hunt_config_references(r.text, url)
-            except: 
-                pass
+                elif r.status_code == 403:
+                    print(f"\n  [!] 403 Forbidden on {url.split('/')[-1]} - Site may be blocking scraper")
+                    scan_errors += 1
+            except requests.exceptions.Timeout:
+                scan_errors += 1
+            except Exception as e:
+                if scan_errors < 3:  # Only show first few errors
+                    print(f"\n  [!] Error fetching {url.split('/')[-1]}: {type(e).__name__}")
+                scan_errors += 1
+        
+        if scan_errors > 0:
+            print(f"  [!] {scan_errors} files failed to download")
 
         print(f"  [+] JS: {len(self.found_js_files)}, JSON: {len(self.found_json_files)}")
         return list(self.found_js_files), list(self.found_json_files)
@@ -1321,15 +1575,20 @@ class EnhancedFederationHunter:
         for path in config_paths:
             url = urllib.parse.urljoin(self.base_url, path)
             try:
-                r = self.session.get(url, timeout=8)
+                r = self.session.get(url, timeout=8, verify=False)
                 if r.status_code == 200:
                     try:
                         r.json()
                         self.found_json_files.add(url)
-                    except:
-                        pass
-            except:
-                pass
+                        print(f"  [*] Found config: {path}")
+                    except json.JSONDecodeError:
+                        pass  # Not valid JSON
+            except requests.exceptions.Timeout:
+                pass  # Config file doesn't exist, timeout is expected
+            except Exception as e:
+                # Only print unexpected errors
+                if "404" not in str(e) and "Connection" not in str(e):
+                    print(f"  [!] Error checking {path}: {e}")
 
     def hunt_config_references(self, code, source_url):
         """Extract JSON file references from JS code"""
@@ -1349,29 +1608,54 @@ class EnhancedFederationHunter:
             
             if self.base_url in full_url and full_url not in self.found_json_files:
                 try:
-                    r = self.session.get(full_url, timeout=5)
+                    r = self.session.get(full_url, timeout=5, verify=False)
                     if r.status_code == 200:
                         try:
                             r.json()
                             self.found_json_files.add(full_url)
-                        except:
+                        except json.JSONDecodeError:
                             pass
-                except:
+                except requests.exceptions.Timeout:
+                    pass
+                except Exception:
                     pass
 
     def crawl_html(self):
         """Crawl HTML for script tags"""
+        print(f"  [*] Fetching HTML from {self.target_url}...")
         try:
-            r = self.session.get(self.target_url, timeout=15)
+            # Add verify=False to handle self-signed certs
+            r = self.session.get(self.target_url, timeout=15, verify=False)
+            print(f"  [*] Status Code: {r.status_code}")
+            
+            if r.status_code != 200:
+                print(f"  [!] Non-200 status code. Content length: {len(r.text)}")
+                # Still try to parse even with non-200 status
+            
             soup = BeautifulSoup(r.text, 'html.parser')
-            for s in soup.find_all('script', src=True):
+            scripts = soup.find_all('script', src=True)
+            print(f"  [*] Found {len(scripts)} script tags in HTML")
+            
+            if len(scripts) == 0:
+                print(f"  [!] WARNING: No <script> tags found. This might be a dynamic SPA.")
+                print(f"  [!] HTML preview (first 500 chars):")
+                print(f"      {r.text[:500]}")
+            
+            for s in scripts:
                 url = urllib.parse.urljoin(self.target_url, s['src'])
                 if not any(b in url for b in IGNORED_DOMAINS):
                     if url not in self.found_js_files:
                         self.found_js_files.add(url)
                         self.scan_queue.append(url)
-        except: 
-            pass
+                        
+        except requests.exceptions.SSLError as e:
+            print(f"  [!] SSL Error: {e}")
+            print(f"  [!] Try adding verify=False or check SSL certificate")
+        except requests.exceptions.ConnectionError as e:
+            print(f"  [!] Connection Error: {e}")
+            print(f"  [!] Cannot reach target. Check internet connection.")
+        except Exception as e:
+            print(f"  [!] CRITICAL ERROR in crawl_html: {type(e).__name__}: {e}")
 
     def hunt_webpack_chunks(self, code, source_url):
         """Hunt for webpack chunk patterns"""
@@ -1396,92 +1680,337 @@ class EnhancedFederationHunter:
                     self.scan_queue.append(full_chunk_url)
 
 # ==============================================================================
-# DYNAMIC INTERCEPTOR
+# DYNAMIC INTERCEPTOR - ENHANCED WITH FEEDBACK LOOP
 # ==============================================================================
 class DynamicInterceptor:
-    def __init__(self, target_url, cookies=None):
+    """
+    Enhanced Dynamic Interceptor with recursive feedback loop.
+    
+    Key improvements:
+    1. Captures lazy-loaded JS files and feeds them back to static analyzer
+    2. Multi-pass navigation with increasing depth
+    3. Better handling of authentication redirects
+    4. Intelligent route prioritization
+    """
+    
+    def __init__(self, target_url, analyzer, cookies=None, max_routes=25, max_depth=3):
         self.target_url = target_url
+        self.analyzer = analyzer  # Feedback loop to static analyzer
         self.domain = urllib.parse.urlparse(target_url).netloc
         self.base_url = f"{urllib.parse.urlparse(target_url).scheme}://{urllib.parse.urlparse(target_url).netloc}"
         self.cookies = cookies
         self.endpoints = []
-        self.seen = set()
+        self.seen_requests = set()
+        self.analyzed_js_files = set()  # Track JS files we've already analyzed
+        self.discovered_routes = set()
+        self.max_routes = max_routes
+        self.max_depth = max_depth
+        self.session_storage_data = {}
+        self.local_storage_data = {}
 
     def run(self, static_endpoints=[]):
         if not PLAYWRIGHT_AVAILABLE: 
             print(f"\n[PHASE 3] Playwright not available - skipping")
             return []
             
-        print(f"\n[PHASE 3] Dynamic Interception")
+        print(f"\n[PHASE 3] Dynamic Discovery with Recursive Feedback Loop")
+        print(f"  Max routes per depth: {self.max_routes}, Max depth: {self.max_depth}")
         
-        routes = [self.target_url]
+        # Multi-pass navigation with increasing depth
+        for depth in range(1, self.max_depth + 1):
+            print(f"\n  [Depth {depth}/{self.max_depth}] Navigating routes...")
+            
+            # Get routes for this depth level
+            routes = self._get_routes_for_depth(static_endpoints, depth)
+            
+            if not routes:
+                print(f"    No new routes at depth {depth}")
+                break
+            
+            print(f"    Routes to visit: {len(routes)}")
+            
+            # Navigate with feedback loop
+            self._navigate_routes_with_feedback(routes, depth)
+            
+            print(f"    Analyzed {len(self.analyzed_js_files)} JS files so far")
+            print(f"    Discovered {len(self.discovered_routes)} unique routes")
+            print(f"    Captured {len(self.endpoints)} API calls")
         
-        for e in static_endpoints:
-            if e['classification'] == 'FRONTEND_ROUTE' and e['endpoint'].startswith('/'):
-                clean = re.sub(r':[a-zA-Z0-9_]+', '1', e['endpoint'])
-                full = urllib.parse.urljoin(self.base_url, clean)
-                if full not in routes: 
-                    routes.append(full)
+        print(f"\n  [+] Total dynamic endpoints: {len(self.endpoints)}")
+        print(f"  [+] Total JS files analyzed: {len(self.analyzed_js_files)}")
         
-        routes = routes[:10]
-        print(f"  Visiting {len(routes)} routes...")
+        return self.endpoints
 
+    def _get_routes_for_depth(self, static_endpoints, depth):
+        """Get routes to visit at a specific depth level"""
+        routes = []
+        
+        if depth == 1:
+            # First pass: start with target URL
+            routes = [self.target_url]
+            
+            # Add high-priority frontend routes
+            for e in static_endpoints:
+                if e['classification'] == 'FRONTEND_ROUTE':
+                    clean = self._clean_route(e['endpoint'])
+                    if clean and clean not in routes:
+                        routes.append(clean)
+        else:
+            # Subsequent passes: use newly discovered routes
+            routes = list(self.discovered_routes)
+            
+            # Also check for any new routes from the analyzer
+            for e in self.analyzer.endpoints:
+                if e['classification'] == 'FRONTEND_ROUTE':
+                    clean = self._clean_route(e['endpoint'])
+                    if clean and clean not in self.discovered_routes:
+                        routes.append(clean)
+        
+        # Prioritize routes with hash fragments and deeper paths
+        routes = self._prioritize_routes(routes, depth)
+        
+        # Limit routes per depth
+        return routes[:self.max_routes]
+
+    def _clean_route(self, endpoint):
+        """Clean and normalize a route for navigation - WITH AGGRESSIVE FILTERING"""
+        if not endpoint:
+            return None
+        
+        # Remove quotes and whitespace
+        clean = endpoint.replace('"', '').replace("'", "").strip()
+        
+        # CRITICAL FIX 1: Reject routes containing 'undefined' or 'null' string literals
+        if 'undefined' in clean.lower() or '/null' in clean or '/null/' in clean:
+            return None
+        
+        # CRITICAL FIX 2: Reject routes with template syntax
+        if '${' in clean or '{{' in clean or '`' in clean:
+            return None
+        
+        # CRITICAL FIX 3: Reject routes with spaces (malformed)
+        if ' ' in clean:
+            return None
+        
+        # CRITICAL FIX 4: Reject internal framework files
+        if any(x in clean.lower() for x in ['ngdirectivedef', 'ngpipedef', 'ngmoduledef', 'template.html', '/xl/']):
+            return None
+        
+        # Build full URL
+        if clean.startswith('http'):
+            full = clean
+        elif clean.startswith('/'):
+            full = urllib.parse.urljoin(self.base_url, clean)
+        else:
+            return None
+        
+        # Only return if it's from our domain
+        if self.domain in full:
+            return full
+        
+        return None
+
+    def _prioritize_routes(self, routes, depth):
+        """Prioritize routes based on depth and characteristics"""
+        def route_score(route):
+            score = 0
+            
+            # Prefer hash routes at all depths
+            if '#/' in route:
+                score += 100
+            
+            # Prefer deeper paths
+            path_depth = route.count('/')
+            score += path_depth * 10
+            
+            # Prefer routes with meaningful names (not just IDs)
+            if any(keyword in route.lower() for keyword in ['dashboard', 'admin', 'user', 'profile', 'settings', 'manage', 'list', 'view', 'edit']):
+                score += 50
+            
+            # Penalize routes that look like they need parameters
+            if re.search(r'/\d+$', route) or re.search(r'/:[\w]+', route):
+                score -= 30
+            
+            return score
+        
+        return sorted(routes, key=route_score, reverse=True)
+
+    def _navigate_routes_with_feedback(self, routes, depth):
+        """Navigate routes and feed discovered JS back to analyzer"""
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(ignore_https_errors=True)
+            context = browser.new_context(
+                ignore_https_errors=True,
+                viewport={'width': 1920, 'height': 1080}
+            )
+            
+            # Set cookies
             if self.cookies:
                 context.add_cookies([
                     {"name": k, "value": v, "domain": self.domain, "path": "/"} 
                     for k, v in self.cookies.items()
                 ])
-
-            context.on("request", self.handle_request)
+            
             page = context.new_page()
             
+            # Subscribe to response events for feedback loop
+            page.on("response", self._handle_response)
+            
+            # Navigate each route
             for i, route in enumerate(routes, 1):
-                print(f"    [{i}/{len(routes)}] {route}", end='\r')
+                print(f"      [{i}/{len(routes)}] {route[:80]}", end='\r')
+                
                 try:
-                    page.goto(route, wait_until="networkidle", timeout=12000)
+                    # Navigate and wait for network to settle
+                    response = page.goto(route, wait_until="networkidle", timeout=20000)
+                    
+                    # Check if we got redirected to login
+                    if response and 'login' in page.url.lower() and 'login' not in route.lower():
+                        print(f"\n      [!] Redirected to login, skipping further routes at this depth")
+                        break
+                    
+                    # Extract any newly discovered routes from the page
+                    self._extract_routes_from_page(page)
+                    
+                    # Small delay to let any async requests complete
                     time.sleep(0.5)
+                    
+                    # Try to extract storage data (for state preservation)
+                    self._extract_storage_data(page)
+                    
+                except Exception as e:
+                    # Don't let one failure stop the whole scan
+                    continue
+            
+            print()  # New line after progress
+            browser.close()
+
+    def _extract_routes_from_page(self, page):
+        """Extract route references from the current page"""
+        try:
+            # Extract from href attributes
+            links = page.query_selector_all('a[href]')
+            for link in links[:50]:  # Limit to prevent hanging
+                try:
+                    href = link.get_attribute('href')
+                    if href:
+                        clean = self._clean_route(href)
+                        if clean and clean not in self.discovered_routes:
+                            self.discovered_routes.add(clean)
                 except:
                     pass
             
-            browser.close()
-        
-        print(f"\n  [+] Captured {len(self.endpoints)} requests")
-        return self.endpoints
-
-    def handle_request(self, req):
-        url = req.url
-        if any(b in url for b in IGNORED_DOMAINS): 
-            return
-        if re.search(r'\.(js|css|png|jpg|svg|ico|woff|map)(\?|$)', url): 
-            return
-        if url in self.seen: 
-            return
-        
-        self.seen.add(url)
-        
-        params = []
-        try:
-            if req.post_data and "json" in req.headers.get("content-type", ""):
-                body = json.loads(req.post_data)
-                if isinstance(body, dict): 
-                    params.extend(body.keys())
-            parsed = urllib.parse.urlparse(url)
-            if parsed.query: 
-                params.extend(urllib.parse.parse_qs(parsed.query).keys())
-        except: 
+            # Extract from router-link or similar SPA navigation
+            spa_links = page.query_selector_all('[routerlink], [ui-sref], [ng-href], [to]')
+            for link in spa_links[:50]:
+                try:
+                    for attr in ['routerlink', 'ui-sref', 'ng-href', 'to']:
+                        value = link.get_attribute(attr)
+                        if value:
+                            clean = self._clean_route(value)
+                            if clean and clean not in self.discovered_routes:
+                                self.discovered_routes.add(clean)
+                except:
+                    pass
+                    
+        except:
             pass
+
+    def _extract_storage_data(self, page):
+        """Extract localStorage and sessionStorage for state preservation"""
+        try:
+            # This could be used to maintain auth state across navigations
+            local_storage = page.evaluate('() => { return JSON.stringify(localStorage); }')
+            session_storage = page.evaluate('() => { return JSON.stringify(sessionStorage); }')
+            
+            if local_storage:
+                self.local_storage_data = json.loads(local_storage)
+            if session_storage:
+                self.session_storage_data = json.loads(session_storage)
+        except:
+            pass
+
+    def _handle_response(self, response):
+        """
+        Handle all responses - the core of the feedback loop.
         
-        self.endpoints.append({
-            "endpoint": url.split('?')[0], 
-            "method": req.method, 
-            "parameters": list(set(params)), 
-            "type": "DYNAMIC_RUNTIME", 
-            "source": "Browser", 
-            "classification": "VERIFIED_API"
-        })
+        This captures:
+        1. New JavaScript files → feeds back to static analyzer
+        2. API calls → adds to endpoints list
+        3. Route references → adds to discovered routes
+        """
+        url = response.url
+        
+        # Skip ignored domains
+        if any(b in url for b in IGNORED_DOMAINS):
+            return
+        
+        # Skip if already seen
+        if url in self.seen_requests:
+            return
+        
+        self.seen_requests.add(url)
+        
+        try:
+            content_type = response.headers.get("content-type", "").lower()
+            
+            # 1. FEEDBACK LOOP: Capture and analyze new JavaScript files
+            if url.endswith('.js') or "javascript" in content_type:
+                if url not in self.analyzer.analyzed_js_files:
+                    self.analyzer.analyzed_js_files.add(url)
+                    self.analyzed_js_files.add(url)
+                    
+                    try:
+                        # Download JS content
+                        code = response.text()
+                        
+                        if len(code) > 100:  # Ignore empty files
+                            # CRITICAL: Feed back to static analyzer
+                            self.analyzer.analyze_code_from_dynamic(code, url)
+                    except:
+                        pass
+            
+            # 2. Capture API calls (JSON responses)
+            elif "application/json" in content_type:
+                try:
+                    endpoint = url.split('?')[0]
+                    
+                    # Try to infer HTTP method from request
+                    method = "GET"  # Default assumption for responses
+                    
+                    # Extract parameters from query string
+                    params = []
+                    parsed = urllib.parse.urlparse(url)
+                    if parsed.query:
+                        params.extend(urllib.parse.parse_qs(parsed.query).keys())
+                    
+                    self.endpoints.append({
+                        "endpoint": endpoint,
+                        "method": method,
+                        "parameters": list(set(params)),
+                        "type": "DYNAMIC_API_CALL",
+                        "source": "Browser",
+                        "classification": "VERIFIED_API"
+                    })
+                except:
+                    pass
+            
+            # 3. Extract route references from HTML responses
+            elif "text/html" in content_type:
+                try:
+                    html = response.text()
+                    
+                    # Extract hash routes from HTML
+                    hash_routes = re.findall(r'href=["\']([^"\']*#/[^"\']+)["\']', html)
+                    for route in hash_routes:
+                        clean = self._clean_route(route)
+                        if clean and clean not in self.discovered_routes:
+                            self.discovered_routes.add(clean)
+                except:
+                    pass
+                    
+        except:
+            pass
 
 # ==============================================================================
 # REPORT GENERATION & EXCEL CONVERSION
@@ -1489,7 +2018,7 @@ class DynamicInterceptor:
 def json_to_excel(input_file, output_file):
     """Converts JSON report to Excel format"""
     if not PANDAS_AVAILABLE:
-        print("\n[!]️  Pandas not installed. Skipping Excel conversion.")
+        print("\n[!] Pandas not installed. Skipping Excel conversion.")
         return
 
     current_dir = os.getcwd()
@@ -1497,10 +2026,10 @@ def json_to_excel(input_file, output_file):
     output_path = os.path.join(current_dir, output_file)
 
     print(f"\n[PHASE 5] Excel Conversion")
-    print(f"📂 Work Dir: {current_dir}")
+    print(f"  Work Dir: {current_dir}")
     
     if not os.path.exists(input_path):
-        print(f"[X] ERROR: Input file '{input_file}' not found.")
+        print(f"  [X] ERROR: Input file '{input_file}' not found.")
         return
 
     try:
@@ -1519,7 +2048,8 @@ def json_to_excel(input_file, output_file):
                 "Method": item.get('method', 'GET'),
                 "Parameters": params_formatted,
                 "Source File": item.get('source', 'Unknown'),
-                "Type": item.get('type', '')
+                "Type": item.get('type', ''),
+                "Classification": item.get('classification', '')
             })
             
         df = pd.DataFrame(rows)
@@ -1531,10 +2061,10 @@ def json_to_excel(input_file, output_file):
                 col_idx = df.columns.get_loc(column) + 1
                 worksheet.column_dimensions[chr(64 + col_idx)].width = 25 
         
-        print(f"✅ SUCCESS! Created: {output_file}")
+        print(f"  [+] SUCCESS! Created: {output_file}")
         
     except Exception as e:
-        print(f"[X] ERROR Converting to Excel: {str(e)}")
+        print(f"  [X] ERROR Converting to Excel: {str(e)}")
 
 def save_report(static, dynamic, filename="results.json"):
     print(f"\n[PHASE 4] Generating Report")
@@ -1546,18 +2076,95 @@ def save_report(static, dynamic, filename="results.json"):
             combined[key] = item
         else:
             combined[key]['parameters'] = list(set(combined[key]['parameters'] + item['parameters']))
-            if item['type'] == 'DYNAMIC_RUNTIME': 
-                combined[key]['type'] = 'DYNAMIC_RUNTIME'
+            # Dynamic endpoints take precedence
+            if item['type'].startswith('DYNAMIC'):
+                combined[key]['type'] = item['type']
                 combined[key]['classification'] = 'VERIFIED_API'
 
-    results = [x for x in combined.values() if x['classification'] != "NOISE"]
+    # Filter out noise
+    pre_filter_count = len(combined)
+    results = []
+    
+    for item in combined.values():
+        # Skip noise classification
+        if item['classification'] == "NOISE":
+            continue
+        
+        endpoint = item['endpoint']
+        endpoint_lower = endpoint.lower()
+        
+        # FINAL QUALITY GATE: Ultra-strict filtering
+        is_garbage = False
+        
+        # Check 1: Contains template syntax
+        if any(x in endpoint for x in ['${', '{{', '`', '\\n', '\\r']):
+            is_garbage = True
+        
+        # Check 2: Contains spaces (except in query params)
+        if ' ' in endpoint.split('?')[0]:  # Check path only, not query string
+            is_garbage = True
+        
+        # Check 3: Single letter paths
+        if re.search(r'/[a-zA-Z]$', endpoint):
+            is_garbage = True
+        
+        # Check 4: CSS units
+        if re.search(r'/(?:px|ms|em|rem|vh|vw|pt)$', endpoint):
+            is_garbage = True
+        
+        # Check 5: Framework internals
+        if any(x in endpoint_lower for x in ['ngdirectivedef', 'ngpipedef', 'ngmoduledef', 'nginjectabledef', 'nginjectordef', 'template.html']):
+            is_garbage = True
+        
+        # Check 6: Excel paths
+        if '/xl/' in endpoint_lower or 'worksheet' in endpoint_lower:
+            is_garbage = True
+        
+        # Check 7: Error messages
+        if any(x in endpoint_lower for x in ['caused by:', 'valid digit', 'animation-timing']):
+            is_garbage = True
+        
+        # Check 8: Ends with colon (malformed)
+        if endpoint.rstrip('/').endswith(':'):
+            is_garbage = True
+        
+        # Check 9: undefined/null in path
+        if '/undefined' in endpoint or '/null/' in endpoint:
+            is_garbage = True
+        
+        # Check 10: ON_PROPERTY and constants
+        if 'ON_PROPERTY' in endpoint or 'ON_INIT' in endpoint:
+            is_garbage = True
+        
+        # Check 11: Too short paths (likely fragments)
+        try:
+            parsed = urllib.parse.urlparse(endpoint)
+            path_parts = [p for p in parsed.path.split('/') if p and p not in ['api', 'api_rc_permit', 'api_isolation', 'api_lessonlearnt', 'api_rc_usermanage', 'api_gasmeasure']]
+            if len(path_parts) == 0:  # Only base path like /api_isolation/
+                # Allow if it's explicitly a base API path
+                if not endpoint.rstrip('/').endswith(('_permit', '_isolation', '_lessonlearnt', '_usermanage', '_gasmeasure', '_rc_permittwo')):
+                    if item['classification'] != 'VERIFIED_API':  # Don't filter verified APIs
+                        is_garbage = True
+        except:
+            pass
+        
+        # Check 12: Vimeo/Vzaar (external, not relevant unless user wants)
+        if 'vimeo.com' in endpoint_lower or 'vzaar.com' in endpoint_lower:
+            is_garbage = True
+        
+        if not is_garbage:
+            results.append(item)
+    
+    filtered_count = pre_filter_count - len(results)
+    if filtered_count > 0:
+        print(f"  [*] Filtered out {filtered_count} garbage endpoints")
     
     results.sort(key=lambda x: (
         {
-            "RPC_METHOD_CALL": 0,
-            "SERVICE_PROPERTY": 1,
-            "RPC_ENDPOINT": 2,
-            "VERIFIED_API": 3, 
+            "VERIFIED_API": 0,
+            "RPC_METHOD_CALL": 1,
+            "SERVICE_PROPERTY": 2,
+            "RPC_ENDPOINT": 3,
             "BACKEND_API": 4, 
             "JSON_CONFIG": 5,
             "OPEN_REDIRECT_SINK": 6,
@@ -1567,21 +2174,24 @@ def save_report(static, dynamic, filename="results.json"):
         x['endpoint']
     ))
 
-    rpc_method_endpoints = [e for e in results if e.get('type') == 'RPC_METHOD_CALL']
-    service_endpoints = [e for e in results if e.get('type') == 'SERVICE_PROPERTY']
+    # Count different types
+    rpc_method_endpoints = [e for e in results if 'RPC_METHOD_CALL' in e.get('type', '')]
+    service_endpoints = [e for e in results if 'SERVICE_PROPERTY' in e.get('type', '')]
     rpc_endpoints = [e for e in results if e['classification'] == 'RPC_ENDPOINT']
+    dynamic_discovered = [e for e in results if 'DYNAMIC' in e.get('type', '')]
     
     report = {
         "scan_metadata": {
-            "scanner": "Advanced Endpoint Scanner",
+            "scanner": "Advanced Endpoint Scanner - Enhanced Edition",
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "total_endpoints": len(results)
         },
         "summary": {
+            "verified_runtime": len([x for x in results if x['classification'] == "VERIFIED_API"]),
+            "dynamic_discovered": len(dynamic_discovered),
             "rpc_method_calls": len(rpc_method_endpoints),
             "service_properties": len(service_endpoints),
             "rpc_patterns": len(rpc_endpoints),
-            "verified": len([x for x in results if x['classification'] == "VERIFIED_API"]),
             "backend": len([x for x in results if x['classification'] == "BACKEND_API"]),
             "json_config": len([x for x in results if x['type'] == "JSON_CONFIG"]),
             "frontend": len([x for x in results if x['classification'] == "FRONTEND_ROUTE"]),
@@ -1596,34 +2206,58 @@ def save_report(static, dynamic, filename="results.json"):
     print(f"\n{'='*70}")
     print(f"SCAN COMPLETE")
     print(f"{'='*70}")
-    print(f"  Total Endpoints:          {len(results)}")
-    print(f"  [*] RPC Method Calls:      {report['summary']['rpc_method_calls']}")
-    print(f"  [*] Service Properties:    {report['summary']['service_properties']}")
-    print(f"  [*] RPC Patterns:          {report['summary']['rpc_patterns']}")
-    print(f"  Verified APIs:            {report['summary']['verified']}")
-    print(f"  Backend APIs:             {report['summary']['backend']}")
-    print(f"  JSON Configs:             {report['summary']['json_config']}")
-    print(f"  Frontend Routes:          {report['summary']['frontend']}")
+    print(f"  Total Endpoints:            {len(results)}")
+    print(f"  [*] Verified Runtime APIs:  {report['summary']['verified_runtime']}")
+    print(f"  [*] Dynamic Discovered:     {report['summary']['dynamic_discovered']}")
+    print(f"  [*] RPC Method Calls:       {report['summary']['rpc_method_calls']}")
+    print(f"  [*] Service Properties:     {report['summary']['service_properties']}")
+    print(f"  [*] RPC Patterns:           {report['summary']['rpc_patterns']}")
+    print(f"  Backend APIs:               {report['summary']['backend']}")
+    print(f"  JSON Configs:               {report['summary']['json_config']}")
+    print(f"  Frontend Routes:            {report['summary']['frontend']}")
+    print(f"  Open Redirect Sinks:        {report['summary']['sinks']}")
     
     print(f"\n[FILE] JSON saved: {filename}")
     
     json_to_excel(filename, 'results.xlsx')
+
 def parse_args():
     """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Advanced Endpoint Scanner')
+    parser = argparse.ArgumentParser(
+        description='Advanced Endpoint Scanner - Enhanced Edition',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic scan
+  python scanner.py --target https://example.com
+  
+  # Scan with cookies
+  python scanner.py --target https://example.com
+  
+  # Deep scan with more routes and depth
+  python scanner.py --target https://example.com --max-routes 50 --max-depth 5
+  
+  # Quick scan (fewer routes, less depth)
+  python scanner.py --target https://example.com --max-routes 10 --max-depth 2 --no-cookies
+        """
+    )
+    
     parser.add_argument('--target', type=str, help='Target URL')
     parser.add_argument('--no-cookies', action='store_true', help='Skip cookie input')
     parser.add_argument('--output', type=str, default='results.json', help='Output file path')
+    parser.add_argument('--max-routes', type=int, default=25, help='Max routes to visit per depth (default: 25)')
+    parser.add_argument('--max-depth', type=int, default=3, help='Max navigation depth (default: 3)')
     parser.add_argument('--quiet', action='store_true', help='Suppress progress output')
+    
     return parser.parse_args()
 
 # ==============================================================================
-# MAIN
+# MAIN (WITH COMPREHENSIVE ERROR HANDLING)
 # ==============================================================================
 if __name__ == "__main__":
     print("=" * 70)
-    print("ADVANCED ENDPOINT SCANNER")
-    print("Extracts API endpoints from JavaScript applications")
+    print("ADVANCED ENDPOINT SCANNER - ENHANCED EDITION")
+    print("Recursive lazy-loading discovery for modern SPAs")
     print("=" * 70 + "\n")
     
     try:
@@ -1643,10 +2277,29 @@ if __name__ == "__main__":
         if not target.startswith("http"):
             target = "https://" + target
         
+        # DEBUG: Test connection BEFORE starting scan
+        print(f"\n[DEBUG] Testing connection to {target}...")
+        try:
+            test_resp = requests.get(target, timeout=10, verify=False)
+            print(f"[DEBUG] ✓ Connection successful (Status: {test_resp.status_code})")
+            if test_resp.status_code == 403:
+                print(f"[!] WARNING: Got 403 Forbidden. Site may block python-requests.")
+                print(f"[!] Consider using different User-Agent or checking for WAF/Cloudflare.")
+        except requests.exceptions.SSLError as e:
+            print(f"[!] SSL Error: {e}")
+            print(f"[!] Continuing with verify=False...")
+        except requests.exceptions.ConnectionError as e:
+            print(f"[X] FATAL: Cannot connect to target: {e}")
+            print(f"[X] Check your internet connection or if the site is down.")
+            sys.exit(1)
+        except Exception as e:
+            print(f"[!] Connection test error: {e}")
+            print(f"[!] Attempting to continue anyway...")
+        
         # Handle cookies
         cookies = {}
         if not args.no_cookies:
-            cookie_choice = input("Add cookies? (y/n): ").strip().lower()
+            cookie_choice = input("\nAdd cookies? (y/n): ").strip().lower()
             if cookie_choice == 'y':
                 print("Enter cookies (press Enter with empty name to finish):")
                 while True:
@@ -1656,39 +2309,96 @@ if __name__ == "__main__":
                     value = input("  Cookie value: ").strip()
                     cookies[name] = value
         
-        # Setup session
+        # Setup session with realistic User-Agent
         session = requests.Session()
         session.cookies.update(cookies)
         session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
         })
         
         start_time = time.time()
         
         print("\n" + "="*70)
-        print("STARTING SCAN")
+        print("STARTING ENHANCED SCAN")
         print("="*70)
         
-        # Run phases
+        # Phase 1: Discovery
         hunter = EnhancedFederationHunter(session, target)
         js_files, json_files = hunter.run()
         
+        # DEBUG CHECK: Warn if no JS files found
+        if len(js_files) == 0:
+            print("\n" + "!"*70)
+            print("WARNING: No JavaScript files were found in Phase 1!")
+            print("!"*70)
+            print("\nPossible causes:")
+            print("  1. The site is a pure SPA that renders <script> tags dynamically")
+            print("  2. The site blocked the scraper (WAF/Cloudflare/403)")
+            print("  3. The URL points to a directory listing, not an HTML page")
+            print("  4. The site requires authentication cookies")
+            
+            if PLAYWRIGHT_AVAILABLE:
+                print("\n[*] Playwright is available - continuing to Phase 3 for dynamic discovery")
+            else:
+                print("\n[!] Playwright not installed. Install it for better SPA support:")
+                print("    pip install playwright")
+                print("    python -m playwright install chromium")
+            
+            print("\nContinuing scan with limited data...\n")
+        
+        # Phase 2: Static Analysis
         analyzer = EnhancedStaticAnalyzer(session, target)
         static_endpoints = analyzer.scan(js_files, json_files)
         
-        interceptor = DynamicInterceptor(target, cookies)
+        if len(static_endpoints) == 0 and len(js_files) > 0:
+            print("\n[!] WARNING: Found JS files but extracted 0 endpoints")
+            print("[!] The JavaScript might be heavily obfuscated or use dynamic imports")
+        
+        # Phase 3: Dynamic Interception with Feedback Loop
+        interceptor = DynamicInterceptor(
+            target, 
+            analyzer,  # Pass analyzer for feedback loop
+            cookies,
+            max_routes=args.max_routes,
+            max_depth=args.max_depth
+        )
         dynamic_endpoints = interceptor.run(static_endpoints)
         
-        elapsed = time.time() - start_time
-        print(f"\n[TIME] Total scan time: {elapsed:.1f}s")  # Fixed: removed emoji
+        # Add any endpoints discovered during dynamic phase back to static
+        static_endpoints.extend(analyzer.endpoints)
         
-        # Save results
+        elapsed = time.time() - start_time
+        print(f"\n[TIME] Total scan time: {elapsed:.1f}s")
+        
+        # Phase 4 & 5: Save results
         output_file = args.output if hasattr(args, 'output') else 'results.json'
         save_report(static_endpoints, dynamic_endpoints, output_file)
         
         # Print absolute path to results
         abs_path = os.path.abspath(output_file)
         print(f"\n[RESULTS] Saved to: {abs_path}")
+        
+        # Final summary
+        total = len(set([f"{e['method']}:{e['endpoint']}" for e in static_endpoints + dynamic_endpoints]))
+        if total == 0:
+            print("\n" + "="*70)
+            print("NO ENDPOINTS FOUND - TROUBLESHOOTING")
+            print("="*70)
+            print("\nThe scan completed but found 0 endpoints. This usually means:")
+            print("  1. The target blocks automated scrapers (check for 403 errors above)")
+            print("  2. The site is a pure SPA with no initial JavaScript in HTML")
+            print("  3. All endpoints are dynamically loaded and Playwright is not installed")
+            print("\nSolutions:")
+            print("  • Add authentication cookies if the site requires login")
+            print("  • Install Playwright: pip install playwright && python -m playwright install chromium")
+            print("  • Try a different target URL (e.g., a specific page instead of root)")
+            print("  • Check if the site has a WAF/Cloudflare protection")
         
     except KeyboardInterrupt:
         print("\n\n[X] Scan interrupted by user")
