@@ -3,6 +3,7 @@
 """
 Endpoint Scanner - Burp Suite Extension
 Integrates the Advanced Endpoint Scanner with Burp Suite
+Supports cookie extraction and authentication
 """
 
 from burp import IBurpExtender, ITab, IHttpListener, IContextMenuFactory
@@ -135,6 +136,21 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
         url_panel.add(self.scan_button, BorderLayout.EAST)
         
         panel.add(url_panel)
+        panel.add(Box.createRigidArea(Dimension(0, 5)))
+        
+        # Cookie input row
+        cookie_panel = JPanel(BorderLayout())
+        cookie_panel.add(JLabel("Cookies (optional): "), BorderLayout.WEST)
+        self.cookie_field = JTextField(40)
+        self.cookie_field.setToolTipText("Format: name1=value1; name2=value2")
+        cookie_panel.add(self.cookie_field, BorderLayout.CENTER)
+        
+        # Button to extract cookies from Burp
+        extract_cookies_btn = JButton("Extract from Burp", actionPerformed=self.on_extract_cookies)
+        extract_cookies_btn.setToolTipText("Extract cookies from selected request in Burp")
+        cookie_panel.add(extract_cookies_btn, BorderLayout.EAST)
+        
+        panel.add(cookie_panel)
         panel.add(Box.createRigidArea(Dimension(0, 5)))
         
         # Options row
@@ -288,6 +304,42 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
         return menu_items
     
     # Action handlers
+    def on_extract_cookies(self, event):
+        """Extract cookies from selected Burp request"""
+        try:
+            # Get the currently selected message in Burp
+            http_traffic = self._callbacks.getSelectedMessages()
+            
+            if not http_traffic or len(http_traffic) == 0:
+                self._update_status("No request selected in Burp", True)
+                self._append_output("\n[!] Please select a request in Burp first")
+                return
+            
+            # Get the first selected message
+            message = http_traffic[0]
+            request_info = self._helpers.analyzeRequest(message)
+            headers = request_info.getHeaders()
+            
+            # Extract Cookie header
+            cookie_value = None
+            for header in headers:
+                header_str = str(header)
+                if header_str.lower().startswith('cookie:'):
+                    cookie_value = header_str[7:].strip()  # Remove "Cookie: " prefix
+                    break
+            
+            if cookie_value:
+                self.cookie_field.setText(cookie_value)
+                self._append_output("\n[+] Extracted cookies from selected request")
+                self._update_status("Cookies extracted successfully", False)
+            else:
+                self._update_status("No cookies found in selected request", True)
+                self._append_output("\n[!] No Cookie header found in selected request")
+        
+        except Exception as e:
+            self._update_status("Failed to extract cookies: %s" % str(e), True)
+            self._append_output("\n[!] Error extracting cookies: %s" % str(e))
+    
     def on_scan_clicked(self, event):
         """Handle scan button click"""
         target_url = self.url_field.getText().strip()
@@ -317,7 +369,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
         thread.start()
     
     def _run_scan(self, target_url):
-        """Run the endpoint scanner - FIXED VERSION"""
+        """Run the endpoint scanner with cookie support"""
         try:
             self._update_status("Scanning: %s" % target_url, False)
             self._update_progress(10, "Starting scan...")
@@ -326,14 +378,40 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
             scanner_dir = os.path.dirname(self.config['scanner_path'])
             results_file = os.path.join(scanner_dir, 'burp_scan_results.json')
             
+            # Get cookies from the cookie field
+            cookie_string = self.cookie_field.getText().strip()
+            
             # Prepare command with arguments
             cmd = [
                 self.config['python_path'],
                 self.config['scanner_path'],
                 '--target', target_url,
-                '--no-cookies',  # Skip cookie prompt
                 '--output', results_file  # Specify output file
             ]
+            
+            # Add cookie handling
+            cookie_file = None
+            if cookie_string:
+                # Create a temporary cookie file
+                cookie_file = os.path.join(scanner_dir, 'burp_cookies.txt')
+                try:
+                    with open(cookie_file, 'w') as f:
+                        # Parse cookie string and write in format: name=value
+                        cookies = cookie_string.split(';')
+                        for cookie in cookies:
+                            cookie = cookie.strip()
+                            if '=' in cookie:
+                                f.write(cookie + '\n')
+                    
+                    cmd.extend(['--cookies-file', cookie_file])
+                    self._append_output("\n[+] Using cookies from input field")
+                    self._append_output("[+] Cookies written to: %s" % cookie_file)
+                except Exception as e:
+                    self._append_output("\n[!] Failed to create cookie file: %s" % str(e))
+                    cmd.append('--no-cookies')
+            else:
+                cmd.append('--no-cookies')  # Skip cookie prompt
+                self._append_output("\n[*] No cookies provided - scanning public endpoints only")
             
             self._append_output("\n[CMD] %s" % ' '.join(cmd))
             self._append_output("[INFO] Running scanner with automated inputs...")
@@ -368,6 +446,14 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
                         self._update_progress(85, "Generating report...")
             
             process.wait()
+            
+            # Cleanup cookie file
+            if cookie_file and os.path.exists(cookie_file):
+                try:
+                    os.remove(cookie_file)
+                    self._append_output("\n[+] Cleaned up temporary cookie file")
+                except:
+                    pass
             
             if process.returncode != 0 and process.returncode != 1:
                 self._update_status("Scanner failed with error code: %d" % process.returncode, True)
@@ -658,22 +744,3 @@ class ScanActionListener(ActionListener):
         
         parsed = urlparse(url)
         base_url = "%s://%s" % (parsed.scheme, parsed.netloc)
-        
-        self.extender.url_field.setText(base_url)
-        self.extender.on_scan_clicked(None)
-
-
-# Auto-scan checkbox listener
-class AutoScanListener(ActionListener):
-    def __init__(self, extender):
-        self.extender = extender
-    
-    def actionPerformed(self, event):
-        """Handle auto-scan toggle"""
-        enabled = self.extender.auto_scan_checkbox.isSelected()
-        self.extender.config['auto_scan'] = enabled
-        
-        if enabled:
-            self.extender._append_output("\n[+] Auto-scan enabled")
-        else:
-            self.extender._append_output("\n[-] Auto-scan disabled")
